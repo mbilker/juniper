@@ -40,13 +40,9 @@ Check the LICENSE file for details.
 #![deny(warnings)]
 #![doc(html_root_url = "https://docs.rs/juniper_warp/0.2.0")]
 
-use futures::{future::poll_fn, Future};
 use serde::Deserialize;
 use std::sync::Arc;
 use warp::{filters::BoxedFilter, Filter};
-
-#[cfg(feature = "async")]
-use futures03::future::{FutureExt, TryFutureExt};
 
 use juniper::{DefaultScalarValue, InputValue, ScalarValue};
 
@@ -111,7 +107,7 @@ where
                     .iter()
                     .map(|request| request.execute_async(root_node, context))
                     .collect::<Vec<_>>();
-                let responses = futures03::future::join_all(futures).await;
+                let responses = futures::future::join_all(futures).await;
 
                 GraphQLBatchResponse::Batch(responses)
             }
@@ -198,7 +194,7 @@ where
 /// let graphql_filter = make_graphql_filter(schema, context_extractor);
 ///
 /// let graphql_endpoint = warp::path("graphql")
-///     .and(warp::post2())
+///     .and(warp::post())
 ///     .and(graphql_filter);
 /// ```
 pub fn make_graphql_filter<Query, Mutation, Context, S>(
@@ -212,58 +208,62 @@ where
     Mutation: juniper::GraphQLType<S, Context = Context, TypeInfo = ()> + Send + Sync + 'static,
 {
     let schema = Arc::new(schema);
+
     let post_schema = schema.clone();
+    let post_schema = warp::any().map(move || Arc::clone(&post_schema));
+    let handle_post_request = |schema: Arc<juniper::RootNode<'static, Query, Mutation, S>>,
+                               context: Context,
+                               request: GraphQLBatchRequest<S>| async {
+        let result = tokio::task::spawn_blocking(move || {
+            let response = request.execute(&schema, &context);
+            Ok((serde_json::to_vec(&response)?, response.is_ok()))
+        })
+        .await
+        .unwrap();
 
-    let handle_post_request =
-        move |context: Context, request: GraphQLBatchRequest<S>| -> Response {
-            let schema = post_schema.clone();
-            Box::new(
-                poll_fn(move || {
-                    tokio_threadpool::blocking(|| {
-                        let response = request.execute(&schema, &context);
-                        Ok((serde_json::to_vec(&response)?, response.is_ok()))
-                    })
-                })
-                .and_then(|result| ::futures::future::done(Ok(build_response(result))))
-                .map_err(warp::reject::custom),
-            )
-        };
+        // TODO: async enclosures are unstable (rust-lang/rust#62290), change the closure return
+        // type when stabilized
+        Response::Ok(build_response(result))
+    };
 
-    let post_filter = warp::post2()
+    let post_filter = warp::post()
+        .and(post_schema)
         .and(context_extractor.clone())
         .and(warp::body::json())
         .and_then(handle_post_request);
 
-    let handle_get_request = move |context: Context,
-                                   mut request: std::collections::HashMap<String, String>|
-          -> Response {
-        let schema = schema.clone();
-        Box::new(
-            poll_fn(move || {
-                tokio_threadpool::blocking(|| {
-                    let variables = match request.remove("variables") {
-                        None => None,
-                        Some(vs) => serde_json::from_str(&vs)?,
-                    };
+    let get_schema = warp::any().map(move || Arc::clone(&schema));
+    let handle_get_request =
+        |schema: Arc<juniper::RootNode<'static, Query, Mutation, S>>,
+         context: Context,
+         mut request: std::collections::HashMap<String, String>| async {
+            let result = tokio::task::spawn_blocking(move || {
+                let variables = match request.remove("variables") {
+                    None => None,
+                    Some(vs) => serde_json::from_str(&vs)?,
+                };
 
-                    let graphql_request = juniper::http::GraphQLRequest::new(
-                        request.remove("query").ok_or_else(|| {
-                            failure::format_err!("Missing GraphQL query string in query parameters")
-                        })?,
-                        request.get("operation_name").map(|s| s.to_owned()),
-                        variables,
-                    );
+                let graphql_request = juniper::http::GraphQLRequest::new(
+                    request.remove("query").ok_or_else(|| {
+                        failure::format_err!("Missing GraphQL query string in query parameters")
+                    })?,
+                    request.get("operation_name").map(|s| s.to_owned()),
+                    variables,
+                );
 
-                    let response = graphql_request.execute(&schema, &context);
-                    Ok((serde_json::to_vec(&response)?, response.is_ok()))
-                })
+                let response = graphql_request.execute(&schema, &context);
+                Ok((serde_json::to_vec(&response)?, response.is_ok()))
             })
-            .and_then(|result| ::futures::future::done(Ok(build_response(result))))
-            .map_err(warp::reject::custom),
-        )
-    };
+            .await
+            .unwrap();
 
-    let get_filter = warp::get2()
+            // TODO: async enclosures are unstable (rust-lang/rust#62290), change the closure return
+            // type when stabilized
+            Response::Ok(build_response(result))
+        };
+
+    let get_filter = warp::get()
+        .and(get_schema)
         .and(context_extractor)
         .and(warp::filters::query::query())
         .and_then(handle_get_request);
@@ -286,60 +286,61 @@ where
     Mutation::TypeInfo: Send + Sync,
 {
     let schema = Arc::new(schema);
+
     let post_schema = schema.clone();
+    let post_schema = warp::any().map(move || Arc::clone(&post_schema));
+    let handle_post_request = |schema: Arc<juniper::RootNode<'static, Query, Mutation, S>>,
+                               context: Context,
+                               request: GraphQLBatchRequest<S>| async {
+        let result = async move {
+            let res = request.execute_async(&schema, &context).await;
 
-    let handle_post_request =
-        move |context: Context, request: GraphQLBatchRequest<S>| -> Response {
-            let schema = post_schema.clone();
+            Ok((serde_json::to_vec(&res)?, res.is_ok()))
+        }
+        .await;
 
-            let f = async move {
-                let res = request.execute_async(&schema, &context).await;
+        // TODO: async enclosures are unstable (rust-lang/rust#62290), change the closure return
+        // type when stabilized
+        Response::Ok(build_response(result))
+    };
 
-                match serde_json::to_vec(&res) {
-                    Ok(json) => Ok(build_response(Ok((json, res.is_ok())))),
-                    Err(e) => Err(warp::reject::custom(e)),
-                }
-            };
-
-            Box::new(f.boxed().compat())
-        };
-
-    let post_filter = warp::post2()
+    let post_filter = warp::post()
+        .and(post_schema)
         .and(context_extractor.clone())
         .and(warp::body::json())
         .and_then(handle_post_request);
 
-    let handle_get_request = move |context: Context,
-                                   mut request: std::collections::HashMap<String, String>|
-          -> Response {
-        let schema = schema.clone();
-        Box::new(
-            poll_fn(move || {
-                tokio_threadpool::blocking(|| {
-                    let variables = match request.remove("variables") {
-                        None => None,
-                        Some(vs) => serde_json::from_str(&vs)?,
-                    };
+    let get_schema = warp::any().map(move || Arc::clone(&schema));
+    let handle_get_request =
+        |schema: Arc<juniper::RootNode<'static, Query, Mutation, S>>,
+         context: Context,
+         mut request: std::collections::HashMap<String, String>| async {
+            let result = tokio::task::spawn_blocking(move || {
+                let variables = match request.remove("variables") {
+                    None => None,
+                    Some(vs) => serde_json::from_str(&vs)?,
+                };
 
-                    let graphql_request = juniper::http::GraphQLRequest::new(
-                        request.remove("query").ok_or_else(|| {
-                            failure::format_err!("Missing GraphQL query string in query parameters")
-                        })?,
-                        request.get("operation_name").map(|s| s.to_owned()),
-                        variables,
-                    );
+                let graphql_request = juniper::http::GraphQLRequest::new(
+                    request.remove("query").ok_or_else(|| {
+                        failure::format_err!("Missing GraphQL query string in query parameters")
+                    })?,
+                    request.get("operation_name").map(|s| s.to_owned()),
+                    variables,
+                );
 
-                    let response = graphql_request.execute(&schema, &context);
-                    Ok((serde_json::to_vec(&response)?, response.is_ok()))
-                })
+                let response = graphql_request.execute(&schema, &context);
+                Ok((serde_json::to_vec(&response)?, response.is_ok()))
             })
-            .and_then(|result| ::futures::future::done(Ok(build_response(result))))
-            .map_err(warp::reject::custom),
-        )
-    };
+            .await
+            .unwrap();
 
-    let get_filter = warp::get2()
-        .and(context_extractor.clone())
+            Response::Ok(build_response(result))
+        };
+
+    let get_filter = warp::get()
+        .and(get_schema)
+        .and(context_extractor)
         .and(warp::filters::query::query())
         .and_then(handle_get_request);
 
@@ -362,8 +363,7 @@ fn build_response(
     }
 }
 
-type Response =
-    Box<dyn Future<Item = warp::http::Response<Vec<u8>>, Error = warp::reject::Rejection> + Send>;
+type Response = Result<warp::http::Response<Vec<u8>>, warp::reject::Rejection>;
 
 /// Create a filter that replies with an HTML page containing GraphiQL. This does not handle routing, so you can mount it on any endpoint.
 ///
@@ -419,23 +419,24 @@ mod tests {
         graphiql_response("/abcd");
     }
 
-    #[test]
-    fn graphiql_endpoint_matches() {
-        let filter = warp::get2()
+    #[tokio::test]
+    async fn graphiql_endpoint_matches() {
+        let filter = warp::get()
             .and(warp::path("graphiql"))
             .and(graphiql_filter("/graphql"));
         let result = request()
             .method("GET")
             .path("/graphiql")
             .header("accept", "text/html")
-            .filter(&filter);
+            .filter(&filter)
+            .await;
 
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn graphiql_endpoint_returns_graphiql_source() {
-        let filter = warp::get2()
+    #[tokio::test]
+    async fn graphiql_endpoint_returns_graphiql_source() {
+        let filter = warp::get()
             .and(warp::path("dogs-api"))
             .and(warp::path("graphiql"))
             .and(graphiql_filter("/dogs-api/graphql"));
@@ -443,7 +444,8 @@ mod tests {
             .method("GET")
             .path("/dogs-api/graphiql")
             .header("accept", "text/html")
-            .reply(&filter);
+            .reply(&filter)
+            .await;
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
@@ -455,23 +457,24 @@ mod tests {
         assert!(body.contains("<script>var GRAPHQL_URL = '/dogs-api/graphql';</script>"));
     }
 
-    #[test]
-    fn playground_endpoint_matches() {
-        let filter = warp::get2()
+    #[tokio::test]
+    async fn playground_endpoint_matches() {
+        let filter = warp::get()
             .and(warp::path("playground"))
             .and(playground_filter("/graphql"));
         let result = request()
             .method("GET")
             .path("/playground")
             .header("accept", "text/html")
-            .filter(&filter);
+            .filter(&filter)
+            .await;
 
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn playground_endpoint_returns_playground_source() {
-        let filter = warp::get2()
+    #[tokio::test]
+    async fn playground_endpoint_returns_playground_source() {
+        let filter = warp::get()
             .and(warp::path("dogs-api"))
             .and(warp::path("playground"))
             .and(playground_filter("/dogs-api/graphql"));
@@ -479,7 +482,8 @@ mod tests {
             .method("GET")
             .path("/dogs-api/playground")
             .header("accept", "text/html")
-            .reply(&filter);
+            .reply(&filter)
+            .await;
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
@@ -491,8 +495,8 @@ mod tests {
         assert!(body.contains("GraphQLPlayground.init(root, { endpoint: '/dogs-api/graphql' })"));
     }
 
-    #[test]
-    fn graphql_handler_works_json_post() {
+    #[tokio::test]
+    async fn graphql_handler_works_json_post() {
         use juniper::{
             tests::{model::Database, schema::Query},
             EmptyMutation, RootNode,
@@ -511,7 +515,8 @@ mod tests {
             .header("accept", "application/json")
             .header("content-type", "application/json")
             .body(r##"{ "variables": null, "query": "{ hero(episode: NEW_HOPE) { name } }" }"##)
-            .reply(&filter);
+            .reply(&filter)
+            .await;
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
@@ -524,8 +529,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn batch_requests_work() {
+    #[tokio::test]
+    async fn batch_requests_work() {
         use juniper::{
             tests::{model::Database, schema::Query},
             EmptyMutation, RootNode,
@@ -549,7 +554,8 @@ mod tests {
                      { "variables": null, "query": "{ hero(episode: EMPIRE) { id name } }" }
                  ]"##,
             )
-            .reply(&filter);
+            .reply(&filter)
+            .await;
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
@@ -574,11 +580,13 @@ mod tests {
 #[cfg(test)]
 mod tests_http_harness {
     use super::*;
+    use bytes::Bytes;
     use juniper::{
         http::tests::{run_http_test_suite, HTTPIntegration, TestResponse},
         tests::{model::Database, schema::Query},
         EmptyMutation, RootNode,
     };
+    use std::cell::RefCell;
     use warp::{self, Filter};
 
     type Schema = juniper::RootNode<'static, Query, EmptyMutation<Database>>;
@@ -594,13 +602,14 @@ mod tests_http_harness {
 
     struct TestWarpIntegration {
         filter: warp::filters::BoxedFilter<(warp::http::Response<Vec<u8>>,)>,
+        runtime: RefCell<tokio::runtime::Runtime>,
     }
 
     // This can't be implemented with the From trait since TestResponse is not defined in this crate.
-    fn test_response_from_http_response(response: warp::http::Response<Vec<u8>>) -> TestResponse {
+    fn test_response_from_http_response(response: warp::http::Response<Bytes>) -> TestResponse {
         TestResponse {
             status_code: response.status().as_u16() as i32,
-            body: Some(String::from_utf8(response.body().to_owned()).unwrap()),
+            body: Some(String::from_utf8(response.body().to_vec()).unwrap()),
             content_type: response
                 .headers()
                 .get("content-type")
@@ -613,48 +622,46 @@ mod tests_http_harness {
 
     impl HTTPIntegration for TestWarpIntegration {
         fn get(&self, url: &str) -> TestResponse {
-            use percent_encoding::{percent_encode, DEFAULT_ENCODE_SET};
-            let url: String = percent_encode(url.replace("/?", "").as_bytes(), DEFAULT_ENCODE_SET)
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join("");
+            use percent_encoding::{percent_encode, CONTROLS};
 
-            let response = warp::test::request()
-                .method("GET")
-                .path(&format!("/?{}", url))
-                .filter(&self.filter)
-                .unwrap_or_else(|rejection| {
-                    warp::http::Response::builder()
-                        .status(rejection.status())
-                        .header("content-type", "application/json")
-                        .body(Vec::new())
-                        .unwrap()
-                });
+            let response = self.runtime.borrow_mut().block_on(async {
+                let url: String = percent_encode(url.replace("/?", "").as_bytes(), CONTROLS)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join("");
+
+                warp::test::request()
+                    .method("GET")
+                    .path(&format!("/?{}", url))
+                    .reply(&self.filter)
+                    .await
+            });
+
             test_response_from_http_response(response)
         }
 
         fn post(&self, url: &str, body: &str) -> TestResponse {
-            let response = warp::test::request()
-                .method("POST")
-                .header("content-type", "application/json")
-                .path(url)
-                .body(body)
-                .filter(&self.filter)
-                .unwrap_or_else(|rejection| {
-                    warp::http::Response::builder()
-                        .status(rejection.status())
-                        .header("content-type", "application/json")
-                        .body(Vec::new())
-                        .unwrap()
-                });
+            let response = self.runtime.borrow_mut().block_on(async {
+                warp::test::request()
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .path(url)
+                    .body(body)
+                    .reply(&self.filter)
+                    .await
+            });
+
             test_response_from_http_response(response)
         }
     }
 
     #[test]
     fn test_warp_integration() {
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio executor");
+
         let integration = TestWarpIntegration {
             filter: warp_server(),
+            runtime: RefCell::new(runtime),
         };
 
         run_http_test_suite(&integration);
